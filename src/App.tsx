@@ -9,9 +9,10 @@ const loadFfmpeg = () => {
   if (!ffmpegReady) {
     ffmpegReady = (async () => {
       const ffmpeg = new FFmpeg();
+      const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
       await ffmpeg.load({
-        coreURL: await toBlobURL('/ffmpeg/ffmpeg-core.js', 'text/javascript'),
-        wasmURL: await toBlobURL('/ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
+        coreURL: await toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm'),
       });
       return ffmpeg;
     })();
@@ -58,7 +59,7 @@ import {
   Upload, Image as ImageIcon, Music, Play, Pause, Download,
   Film, Clock, CheckCircle, Loader, Zap, Link2, FileText,
   RectangleHorizontal, RectangleVertical, AlertCircle,
-  Trash2, ChevronUp, ChevronDown
+  Trash2, ChevronUp, ChevronDown, FolderOpen
 } from 'lucide-react';
 
 interface ImageItem {
@@ -99,6 +100,44 @@ interface VoicePartFile {
   name: string;
   url: string;
   duration: number;
+}
+
+type MediaKind = 'image' | 'video';
+
+interface MediaCue {
+  number: string;
+  kind: MediaKind;
+}
+
+interface RenamedDrop {
+  id: string;
+  originalName: string;
+  name: string;
+  kind: MediaKind;
+  url: string;
+  data: Uint8Array;
+}
+
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif']);
+const VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'mkv', 'm4v', 'avi']);
+
+function parseCueLine(line: string): MediaCue | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const numberFirst = trimmed.match(/^(\d+)\b[\s,|:./-]*(image|img|photo|picture|video|vid|clip)\b/i);
+  const typeFirst = trimmed.match(/^(image|img|photo|picture|video|vid|clip)\b[\s,|:./-]*(\d+)\b/i);
+  const rawNumber = numberFirst?.[1] ?? typeFirst?.[2];
+  const rawKind = (numberFirst?.[2] ?? typeFirst?.[1] ?? '').toLowerCase();
+  if (!rawNumber || !rawKind) return null;
+  const kind: MediaKind = rawKind.startsWith('v') || rawKind === 'clip' ? 'video' : 'image';
+  return { number: rawNumber.padStart(3, '0'), kind };
+}
+
+function mediaKindOf(name: string): MediaKind | null {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  if (IMAGE_EXT.has(ext)) return 'image';
+  if (VIDEO_EXT.has(ext)) return 'video';
+  return null;
 }
 
 interface Caption {
@@ -414,6 +453,13 @@ export default function App() {
   const [isSplitting, setIsSplitting] = useState(false);
   const [voiceParts, setVoiceParts] = useState<VoicePartFile[]>([]);
   const [voiceZipUrl, setVoiceZipUrl] = useState('');
+  const [mediaCues, setMediaCues] = useState<MediaCue[]>([]);
+  const [cueFileName, setCueFileName] = useState('');
+  const [watchFolderName, setWatchFolderName] = useState('');
+  const [isWatching, setIsWatching] = useState(false);
+  const [renamedDrops, setRenamedDrops] = useState<RenamedDrop[]>([]);
+  const [dropsZipUrl, setDropsZipUrl] = useState('');
+  const [watchNote, setWatchNote] = useState('');
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const exportProgressTextRef = useRef<HTMLSpanElement>(null);
@@ -423,6 +469,11 @@ export default function App() {
   const animFrameRef = useRef<number>(0);
   const currentAudioIndexRef = useRef<number>(0);
   const playTokenRef = useRef(0);
+  const mediaCuesRef = useRef<MediaCue[]>([]);
+  const cueCursorRef = useRef({ image: 0, video: 0 });
+  const seenDropNamesRef = useRef<Set<string>>(new Set());
+  const watchDirRef = useRef<(FileSystemDirectoryHandle & { entries: () => AsyncIterable<[string, FileSystemFileHandle | FileSystemDirectoryHandle]> }) | null>(null);
+  const renamedNamesRef = useRef<Set<string>>(new Set());
 
   const loadImage = (file: File): Promise<{ img: HTMLImageElement; url: string }> => {
     return new Promise((resolve) => {
@@ -686,13 +737,52 @@ export default function App() {
         return zipUrl;
       });
       const lastName = downloads[downloads.length - 1].name;
-      setStatusMsg(`${downloads.length} files ready: 001.mp3 se ${lastName}. Inhen neeche Audio box mein upload karke images ke naam se match karo.`);
+      setStatusMsg(`${downloads.length} files ready: 001.mp3 se ${lastName}. Move to Audio se yeh seedha neeche Audio box mein chali jayengi.`);
+      return downloads;
     } catch (error) {
       setStatusMsg(error instanceof Error ? error.message : 'Audio split nahi ho saki.');
     } finally {
       setIsSplitting(false);
       audioContext.close().catch(() => {});
     }
+    return [];
+  };
+
+  const movePartsToAudio = async (parts: VoicePartFile[]) => {
+    if (parts.length === 0) {
+      setStatusMsg('Pehle audio split karo, phir Move to Audio dabao.');
+      return;
+    }
+    const incoming: AudioItem[] = [];
+    for (const part of parts) {
+      const blob = await fetch(part.url).then((response) => response.blob());
+      const file = new File([blob], part.name, { type: 'audio/mpeg' });
+      incoming.push({
+        id: Math.random().toString(36).substr(2, 9),
+        file,
+        url: part.url,
+        name: part.name,
+        baseName: getBaseName(part.name),
+        duration: part.duration,
+      });
+    }
+    // The object URL is now owned by the Audio list. Drop it from the split list without revoking.
+    const moved = new Set(incoming.map((item) => item.name));
+    setVoiceParts((current) => current.filter((part) => !moved.has(part.name)));
+    setAudios((prev) => {
+      const names = new Set(incoming.map((item) => item.baseName));
+      prev.forEach((item) => {
+        if (names.has(item.baseName)) URL.revokeObjectURL(item.url);
+      });
+      return [...prev.filter((item) => !names.has(item.baseName)), ...incoming];
+    });
+    setStage('uploading');
+    setStatusMsg(`${incoming.length} split files Audio box mein aa gayi hain. Download karke dubara upload ki zaroorat nahi.`);
+  };
+
+  const splitAndMoveToAudio = async () => {
+    const parts = await downloadSplitVoice();
+    if (parts && parts.length > 0) await movePartsToAudio(parts);
   };
 
   const splitFullNarration = async () => {
@@ -749,6 +839,143 @@ export default function App() {
       setIsSplitting(false);
       audioContext.close().catch(() => {});
     }
+  };
+
+  useEffect(() => {
+    mediaCuesRef.current = mediaCues;
+  }, [mediaCues]);
+
+  useEffect(() => {
+    if (!dropsZipUrl) return;
+    return () => URL.revokeObjectURL(dropsZipUrl);
+  }, [dropsZipUrl]);
+
+  const handleCueFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const text = await file.text();
+    const cues = text.split(/\r?\n/).map(parseCueLine).filter((cue): cue is MediaCue => cue !== null);
+    cueCursorRef.current = { image: 0, video: 0 };
+    setMediaCues(cues);
+    setCueFileName(file.name);
+    const images = cues.filter((cue) => cue.kind === 'image').length;
+    const videos = cues.filter((cue) => cue.kind === 'video').length;
+    setWatchNote(cues.length === 0
+      ? 'Koi line samajh nahi aayi. Har line pe number aur image/video likho, jaise 009 image.'
+      : `${cues.length} narrations: ${images} image, ${videos} video. Nayi file pe counter shuru se chalega.`);
+  };
+
+  const takeNextCue = (kind: MediaKind) => {
+    const cues = mediaCuesRef.current;
+    const cursor = cueCursorRef.current;
+    let index = kind === 'image' ? cursor.image : cursor.video;
+    while (index < cues.length && cues[index].kind !== kind) index += 1;
+    if (index >= cues.length) return null;
+    if (kind === 'image') cursor.image = index + 1;
+    else cursor.video = index + 1;
+    return cues[index];
+  };
+
+  const claimDrop = async (handle: FileSystemFileHandle, originalName: string) => {
+    const kind = mediaKindOf(originalName);
+    if (!kind) return false;
+    const cue = takeNextCue(kind);
+    if (!cue) {
+      setWatchNote(`${originalName} ${kind} hai, lekin list mein agla ${kind} number nahi bacha.`);
+      return false;
+    }
+    const ext = originalName.includes('.') ? originalName.slice(originalName.lastIndexOf('.')) : '';
+    let name = `${cue.number}${ext.toLowerCase()}`;
+    if (renamedNamesRef.current.has(name)) {
+      const stem = cue.number;
+      let n = 2;
+      while (renamedNamesRef.current.has(`${stem}-${n}${ext.toLowerCase()}`)) n += 1;
+      name = `${stem}-${n}${ext.toLowerCase()}`;
+    }
+    renamedNamesRef.current.add(name);
+    const file = await handle.getFile();
+    const data = new Uint8Array(await file.arrayBuffer());
+    const url = URL.createObjectURL(new Blob([data], { type: file.type || 'application/octet-stream' }));
+    setRenamedDrops((current) => [
+      ...current,
+      { id: `${name}-${Date.now()}`, originalName, name, kind, url, data },
+    ]);
+    setWatchNote(`${originalName} → ${name}`);
+    return true;
+  };
+
+  const selectWatchFolder = async () => {
+    const picker = (window as Window & { showDirectoryPicker?: (options?: { mode?: string }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+    if (!picker) {
+      setWatchNote('Folder watch Chrome ya Edge mein chalta hai.');
+      return;
+    }
+    const dir = await picker({ mode: 'read' });
+    const readable = dir as FileSystemDirectoryHandle & { entries: () => AsyncIterable<[string, FileSystemFileHandle | FileSystemDirectoryHandle]> };
+    watchDirRef.current = readable;
+    seenDropNamesRef.current = new Set();
+    for await (const [name, entry] of readable.entries()) {
+      if (entry.kind === 'file') seenDropNamesRef.current.add(name);
+    }
+    setWatchFolderName(dir.name);
+    setIsWatching(true);
+    setWatchNote(`${dir.name} dekh raha hoon. Jo files pehle se thin woh skip hain. Ab nayi image ya video daalo.`);
+  };
+
+  const stopWatching = () => {
+    watchDirRef.current = null;
+    setIsWatching(false);
+    setWatchNote('Watch band ho gayi.');
+  };
+
+  const clearRenamed = () => {
+    renamedDrops.forEach((item) => URL.revokeObjectURL(item.url));
+    renamedNamesRef.current = new Set();
+    cueCursorRef.current = { image: 0, video: 0 };
+    setRenamedDrops([]);
+    setDropsZipUrl('');
+    setWatchNote('Saved files clear. Agli file pehle number se shuru hogi.');
+  };
+
+  useEffect(() => {
+    if (!isWatching) return;
+    let stopped = false;
+    const tick = async () => {
+      const dir = watchDirRef.current;
+      if (!dir || stopped) return;
+      try {
+        for await (const [name, entry] of dir.entries()) {
+          if (stopped || entry.kind !== 'file' || seenDropNamesRef.current.has(name)) continue;
+          if (!mediaKindOf(name)) {
+            seenDropNamesRef.current.add(name);
+            continue;
+          }
+          if (mediaCuesRef.current.length === 0) continue;
+          await claimDrop(entry, name);
+          seenDropNamesRef.current.add(name);
+        }
+      } catch (error) {
+        if (!stopped) setWatchNote(error instanceof Error ? error.message : 'Folder read nahi ho saka.');
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [isWatching]);
+
+  const downloadRenamedFolder = () => {
+    if (renamedDrops.length === 0) return;
+    const zip = makeZip(renamedDrops.map((item) => ({ name: item.name, data: item.data })));
+    const url = URL.createObjectURL(zip);
+    setDropsZipUrl(url);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'renamed-media.zip';
+    link.click();
   };
 
   const drawFrame = (ctx: CanvasRenderingContext2D, img: HTMLImageElement, progress: number, effect: EffectType, width: number, height: number, time?: number, fit: FitMode = 'cover', layer?: { opacity?: number; clear?: boolean; captions?: boolean }) => {
@@ -1506,6 +1733,15 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={splitAndMoveToAudio}
+              disabled={isSplitting || isExporting}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-300 text-zinc-950 text-sm font-semibold disabled:opacity-50"
+            >
+              <Music className="w-4 h-4" />
+              Split and move to Audio
+            </button>
+            <button
+              type="button"
               onClick={splitFullNarration}
               disabled={isSplitting || isExporting}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-white/15 text-sm font-medium text-zinc-200 disabled:opacity-50"
@@ -1514,14 +1750,24 @@ export default function App() {
               Split onto timeline
             </button>
           </div>
-          {voiceParts.length > 0 && voiceZipUrl && (
+          {voiceZipUrl && (
             <div className="mt-4 rounded-xl border border-white/10 bg-zinc-950/60 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                <p className="text-sm font-medium text-zinc-100">{voiceParts.length} files · 001.mp3 se {voiceParts[voiceParts.length - 1].name}</p>
+                <p className="text-sm font-medium text-zinc-100">{voiceParts.length > 0 ? `${voiceParts.length} files · 001.mp3 se ${voiceParts[voiceParts.length - 1].name}` : 'Split files Audio box mein move ho chuki hain.'}</p>
+                {voiceParts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => movePartsToAudio(voiceParts)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-300 text-zinc-950 text-sm font-semibold"
+                  >
+                    <Music className="w-4 h-4" />
+                    Move to Audio
+                  </button>
+                )}
                 <a
                   href={voiceZipUrl}
                   download="voice-parts.zip"
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-300 text-zinc-950 text-sm font-semibold"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-white/15 text-sm font-semibold text-zinc-100"
                 >
                   <Download className="w-4 h-4" />
                   Download all
@@ -1536,6 +1782,86 @@ export default function App() {
                     <a href={part.url} download={part.name} className="ml-auto text-amber-200 hover:text-white">
                       Download
                     </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-sky-400/30 bg-sky-500/5 p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+            <div>
+              <h2 className="text-sm font-semibold flex items-center gap-2">
+                <FolderOpen className="w-4 h-4 text-sky-300" />
+                Watch folder and rename
+              </h2>
+              <p className="text-xs text-zinc-400 mt-1 max-w-2xl">
+                Ek text file do jisme har line pe narration number aur type ho, jaise <span className="text-zinc-200">009 image</span> ya <span className="text-zinc-200">014 video</span>. Phir folder select karo. Jo nayi image aayegi woh agle image number se save hogi, nayi video agle video number se.
+              </p>
+            </div>
+            <span className="text-[11px] text-zinc-500">{isWatching ? 'Watching' : 'Stopped'}</span>
+          </div>
+          <div className="grid md:grid-cols-2 gap-3">
+            <label className="block rounded-xl border border-dashed border-sky-400/40 bg-zinc-950/50 p-4 cursor-pointer hover:bg-sky-500/5">
+              <input type="file" accept=".txt,.csv,text/plain" onChange={handleCueFile} className="hidden" />
+              <span className="flex items-center gap-3">
+                <span className="w-10 h-10 rounded-full bg-sky-500/15 text-sky-200 flex items-center justify-center shrink-0">
+                  <FileText className="w-4 h-4" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium">{cueFileName || 'Narration list'}</span>
+                  <span className="block text-xs text-zinc-500 truncate">
+                    {mediaCues.length === 0 ? '009 image / 010 video, ek line ek narration' : `${mediaCues.filter((cue) => cue.kind === 'image').length} image · ${mediaCues.filter((cue) => cue.kind === 'video').length} video`}
+                  </span>
+                </span>
+              </span>
+            </label>
+            <div className="rounded-xl border border-white/10 bg-zinc-950/50 p-4 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate">{watchFolderName || 'Koi folder select nahi'}</p>
+                <p className="text-xs text-zinc-500">
+                  Next image {(() => {
+                    const left = mediaCues.filter((cue) => cue.kind === 'image');
+                    const used = renamedDrops.filter((item) => item.kind === 'image').length;
+                    return left[used]?.number ?? '—';
+                  })()} · next video {(() => {
+                    const left = mediaCues.filter((cue) => cue.kind === 'video');
+                    const used = renamedDrops.filter((item) => item.kind === 'video').length;
+                    return left[used]?.number ?? '—';
+                  })()}
+                </p>
+              </div>
+              {isWatching ? (
+                <button type="button" onClick={stopWatching} className="px-3 py-2 rounded-xl border border-white/15 text-sm text-zinc-200">Stop</button>
+              ) : (
+                <button type="button" onClick={selectWatchFolder} className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white text-zinc-950 text-sm font-semibold">
+                  <FolderOpen className="w-4 h-4" />
+                  Select folder
+                </button>
+              )}
+            </div>
+          </div>
+          {watchNote && <p className="mt-3 text-xs text-zinc-300">{watchNote}</p>}
+          {renamedDrops.length > 0 && (
+            <div className="mt-4 rounded-xl border border-white/10 bg-zinc-950/60 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                <p className="text-sm font-medium text-zinc-100">{renamedDrops.length} renamed</p>
+                <div className="flex gap-2">
+                  <button type="button" onClick={clearRenamed} className="px-3 py-2 rounded-xl border border-white/15 text-sm text-zinc-300">Clear</button>
+                  <button type="button" onClick={downloadRenamedFolder} className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-sky-300 text-zinc-950 text-sm font-semibold">
+                    <Download className="w-4 h-4" />
+                    Download folder
+                  </button>
+                </div>
+              </div>
+              <ul className="max-h-48 overflow-auto space-y-1.5 pr-1">
+                {renamedDrops.map((item) => (
+                  <li key={item.id} className="flex items-center gap-2 text-xs text-zinc-300 rounded-lg bg-zinc-900 border border-white/5 px-2.5 py-2">
+                    {item.kind === 'image' ? <ImageIcon className="w-3.5 h-3.5 text-sky-300 shrink-0" /> : <Film className="w-3.5 h-3.5 text-sky-300 shrink-0" />}
+                    <span className="font-medium text-zinc-100">{item.name}</span>
+                    <span className="text-zinc-500 truncate">{item.originalName}</span>
+                    <a href={item.url} download={item.name} className="ml-auto text-sky-200 hover:text-white">Download</a>
                   </li>
                 ))}
               </ul>
