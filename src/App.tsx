@@ -1714,7 +1714,7 @@ export default function App() {
               <input
                 type="range"
                 min={0.2}
-                max={1.5}
+                max={3}
                 step={0.1}
                 value={silenceGap}
                 onChange={(event) => setSilenceGap(Number(event.target.value))}
